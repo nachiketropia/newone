@@ -1,0 +1,91 @@
+import os
+from pathlib import Path
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import numpy as np
+
+def combine_orthomosaics(parent_folder, output_file="combined_orthomosaic.tif"):
+    """
+    Combines all orthophoto.tif files from subfolders into a single orthomosaic.
+    
+    Args:
+        parent_folder: Path to the parent folder containing subfolders
+        output_file: Name of the output combined orthomosaic file
+    """
+    parent_path = Path(parent_folder)
+    tif_files = []
+    
+    # Find all orthophoto files (both .tif and .tiff extensions)
+    print("Searching for orthophoto files (.tif or .tiff)...")
+    for subfolder in parent_path.iterdir():
+        if subfolder.is_dir():
+            # Check for both .tif and .tiff extensions
+            tif_path = subfolder / "orthophoto.tif"
+            tiff_path = subfolder / "orthophoto.tiff"
+            
+            if tif_path.exists():
+                tif_files.append(str(tif_path))
+                print(f"Found: {tif_path}")
+            elif tiff_path.exists():
+                tif_files.append(str(tiff_path))
+                print(f"Found: {tiff_path}")
+    
+    if not tif_files:
+        print("No orthophoto files (.tif or .tiff) found!")
+        return
+    
+    print(f"\nFound {len(tif_files)} orthophoto files")
+    print("Opening raster files...")
+    
+    # Open all raster files
+    src_files = []
+    try:
+        for tif in tif_files:
+            src = rasterio.open(tif)
+            src_files.append(src)
+        
+        print("Merging rasters...")
+        # Merge all rasters into one
+        mosaic, out_transform = merge(src_files)
+        
+        # Get metadata from the first file
+        out_meta = src_files[0].meta.copy()
+        
+        # Update metadata for the mosaic
+        out_meta.update({
+            "driver": "GTiff",
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_transform,
+            "compress": "lzw"  # Add compression to reduce file size
+        })
+        
+        # Write the mosaic to a new file
+        output_path = parent_path / output_file
+        print(f"Writing combined orthomosaic to {output_path}...")
+        
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(mosaic)
+        
+        print(f"✓ Successfully created combined orthomosaic: {output_path}")
+        print(f"  Dimensions: {mosaic.shape[2]} x {mosaic.shape[1]} pixels")
+        print(f"  Bands: {mosaic.shape[0]}")
+        
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        raise
+    
+    finally:
+        # Close all opened files
+        for src in src_files:
+            src.close()
+
+if __name__ == "__main__":
+    # Example usage
+    parent_folder = "path/to/your/parent/folder"  # Change this to your folder path
+    
+    # Optional: specify custom output filename
+    output_filename = "combined_orthomosaic.tif"
+    
+    combine_orthomosaics(parent_folder, output_filename)
