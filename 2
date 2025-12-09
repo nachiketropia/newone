@@ -1,0 +1,286 @@
+import os
+from pathlib import Path
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import numpy as np
+import json
+
+def combine_orthomosaics(parent_folder, output_file="combined_orthomosaic.tif", create_html=True):
+    """
+    Combines all orthophoto.tif files from subfolders into a single orthomosaic.
+    
+    Args:
+        parent_folder: Path to the parent folder containing subfolders
+        output_file: Name of the output combined orthomosaic file
+        create_html: Whether to create an HTML viewer for the map
+    """
+    parent_path = Path(parent_folder)
+    tif_files = []
+    geojson_files = []
+    
+    # Find all orthophoto files (both .tif and .tiff extensions)
+    print("Searching for orthophoto files (.tif or .tiff) and geojson files...")
+    for subfolder in parent_path.iterdir():
+        if subfolder.is_dir():
+            # Check for both .tif and .tiff extensions
+            tif_path = subfolder / "orthophoto.tif"
+            tiff_path = subfolder / "orthophoto.tiff"
+            
+            if tif_path.exists():
+                tif_files.append(str(tif_path))
+                print(f"Found: {tif_path}")
+            elif tiff_path.exists():
+                tif_files.append(str(tiff_path))
+                print(f"Found: {tiff_path}")
+            
+            # Check for geojson files
+            for geojson_file in subfolder.glob("*.geojson"):
+                geojson_files.append(str(geojson_file))
+                print(f"Found: {geojson_file}")
+    
+    if not tif_files:
+        print("No orthophoto files (.tif or .tiff) found!")
+        return
+    
+    print(f"\nFound {len(tif_files)} orthophoto files")
+    print("Opening raster files...")
+    
+    # Open all raster files
+    src_files = []
+    try:
+        for tif in tif_files:
+            src = rasterio.open(tif)
+            src_files.append(src)
+        
+        print("Merging rasters...")
+        # Merge all rasters into one
+        mosaic, out_transform = merge(src_files)
+        
+        # Get metadata from the first file
+        out_meta = src_files[0].meta.copy()
+        
+        # Update metadata for the mosaic
+        out_meta.update({
+            "driver": "GTiff",
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_transform,
+            "compress": "lzw"  # Add compression to reduce file size
+        })
+        
+        # Write the mosaic to a new file
+        output_path = parent_path / output_file
+        print(f"Writing combined orthomosaic to {output_path}...")
+        
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(mosaic)
+        
+        print(f"✓ Successfully created combined orthomosaic: {output_path}")
+        print(f"  Dimensions: {mosaic.shape[2]} x {mosaic.shape[1]} pixels")
+        print(f"  Bands: {mosaic.shape[0]}")
+        
+        # Create HTML viewer if requested
+        if create_html:
+            bounds = src_files[0].bounds
+            center_lat = (bounds.bottom + bounds.top) / 2
+            center_lon = (bounds.left + bounds.right) / 2
+            create_html_viewer(parent_path, geojson_files, center_lat, center_lon)
+        
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        raise
+    
+    finally:
+        # Close all opened files
+        for src in src_files:
+            src.close()
+
+def create_html_viewer(parent_path, geojson_files, center_lat, center_lon):
+    """
+    Creates an HTML viewer with Leaflet to display GeoJSON files.
+    
+    Args:
+        parent_path: Path object to the parent folder
+        geojson_files: List of paths to geojson files
+        center_lat: Latitude for map center
+        center_lon: Longitude for map center
+    """
+    print("\nCreating HTML map viewer...")
+    
+    # Load all GeoJSON data
+    geojson_data = []
+    for geojson_path in geojson_files:
+        try:
+            with open(geojson_path, 'r') as f:
+                data = json.load(f)
+                geojson_data.append({
+                    'name': Path(geojson_path).parent.name,
+                    'data': data
+                })
+        except Exception as e:
+            print(f"Warning: Could not load {geojson_path}: {e}")
+    
+    # Generate colors for different layers
+    colors = ['#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', 
+              '#FFA500', '#800080', '#008000', '#000080']
+    
+    html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Orthomosaic Viewer</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }}
+        #map {{
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }}
+        .legend {{
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            max-height: 300px;
+            overflow-y: auto;
+        }}
+        .legend h4 {{
+            margin: 0 0 10px 0;
+        }}
+        .legend-item {{
+            margin: 5px 0;
+            display: flex;
+            align-items: center;
+        }}
+        .legend-color {{
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            border: 1px solid #333;
+        }}
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        // Initialize map
+        var map = L.map('map').setView([{center_lat}, {center_lon}], 13);
+        
+        // Add OpenStreetMap base layer
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 19
+        }}).addTo(map);
+        
+        // Add satellite imagery option
+        var satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            attribution: 'Tiles © Esri'
+        }});
+        
+        var baseMaps = {{
+            "Street Map": L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png'),
+            "Satellite": satellite
+        }};
+        
+        // Add GeoJSON layers
+        var overlays = {{}};
+        var legendItems = [];
+'''
+    
+    # Add each GeoJSON layer
+    for idx, geojson_item in enumerate(geojson_data):
+        color = colors[idx % len(colors)]
+        layer_name = geojson_item['name']
+        geojson_str = json.dumps(geojson_item['data'])
+        
+        html_content += f'''
+        var layer_{idx} = L.geoJSON({geojson_str}, {{
+            style: {{
+                color: '{color}',
+                weight: 2,
+                opacity: 0.8,
+                fillOpacity: 0.3
+            }},
+            onEachFeature: function(feature, layer) {{
+                if (feature.properties) {{
+                    var popupContent = '<div style="max-width: 200px;">';
+                    popupContent += '<strong>{layer_name}</strong><br>';
+                    for (var key in feature.properties) {{
+                        popupContent += key + ': ' + feature.properties[key] + '<br>';
+                    }}
+                    popupContent += '</div>';
+                    layer.bindPopup(popupContent);
+                }}
+            }}
+        }}).addTo(map);
+        overlays['{layer_name}'] = layer_{idx};
+        legendItems.push({{name: '{layer_name}', color: '{color}'}});
+'''
+    
+    html_content += '''
+        // Add layer control
+        L.control.layers(baseMaps, overlays).addTo(map);
+        
+        // Add legend
+        var legend = L.control({position: 'bottomright'});
+        legend.onAdd = function(map) {
+            var div = L.DomUtil.create('div', 'legend');
+            div.innerHTML = '<h4>Layers</h4>';
+            legendItems.forEach(function(item) {
+                div.innerHTML += '<div class="legend-item">' +
+                    '<div class="legend-color" style="background-color: ' + item.color + '"></div>' +
+                    '<span>' + item.name + '</span>' +
+                    '</div>';
+            });
+            return div;
+        };
+        legend.addTo(map);
+        
+        // Fit map to all layers
+        var bounds = L.latLngBounds();
+        Object.values(overlays).forEach(function(layer) {
+            if (layer.getBounds) {
+                bounds.extend(layer.getBounds());
+            }
+        });
+        if (bounds.isValid()) {
+            map.fitBounds(bounds);
+        }
+    </script>
+</body>
+</html>'''
+    
+    # Write HTML file
+    html_path = parent_path / "map_viewer.html"
+    with open(html_path, 'w') as f:
+        f.write(html_content)
+    
+    print(f"✓ HTML viewer created: {html_path}")
+    print(f"  Open this file in a web browser to view the map")
+        
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        raise
+    
+    finally:
+        # Close all opened files
+        for src in src_files:
+            src.close()
+
+if __name__ == "__main__":
+    # Example usage
+    parent_folder = "path/to/your/parent/folder"  # Change this to your folder path
+    
+    # Optional: specify custom output filename
+    output_filename = "combined_orthomosaic.tif"
+    
+    combine_orthomosaics(parent_folder, output_filename)
