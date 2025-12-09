@@ -1,0 +1,338 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ================== DATASET ==================
+class ChangeDetectionDataset(Dataset):
+    """Dataset for bitemporal change detection"""
+    
+    def __init__(self, img1_dir, img2_dir, label_dir, transform=None, img_size=256):
+        self.img1_dir = Path(img1_dir)
+        self.img2_dir = Path(img2_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = img_size
+        
+        # Get all image filenames (same names in all folders)
+        self.image_names = sorted([f.name for f in self.img1_dir.glob('*.*') 
+                                   if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.tif', '.tiff']])
+        
+        print(f"Found {len(self.image_names)} image pairs")
+        
+        # Default transform if none provided
+        if transform is None:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = transform
+            
+        self.label_transform = transforms.Compose([
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.ToTensor()
+        ])
+    
+    def __len__(self):
+        return len(self.image_names)
+    
+    def __getitem__(self, idx):
+        img_name = self.image_names[idx]
+        
+        # Load images
+        img1 = Image.open(self.img1_dir / img_name).convert('RGB')
+        img2 = Image.open(self.img2_dir / img_name).convert('RGB')
+        label = Image.open(self.label_dir / img_name).convert('L')  # Grayscale
+        
+        # Apply transforms
+        img1 = self.transform(img1)
+        img2 = self.transform(img2)
+        label = self.label_transform(label)
+        
+        # Convert label to binary (0 or 1)
+        label = (label > 0.5).long().squeeze(0)
+        
+        return img1, img2, label, img_name
+
+
+# ================== MODEL COMPONENTS ==================
+class PatchEmbedding(nn.Module):
+    """Split image into patches and embed them"""
+    
+    def __init__(self, img_size=256, patch_size=16, in_channels=3, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, embed_dim, n_patches_h, n_patches_w)
+        x = self.proj(x)
+        # Flatten: (B, embed_dim, n_patches_h, n_patches_w) -> (B, embed_dim, n_patches)
+        x = x.flatten(2)
+        # Transpose: (B, embed_dim, n_patches) -> (B, n_patches, embed_dim)
+        x = x.transpose(1, 2)
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    """Simple Transformer Encoder"""
+    
+    def __init__(self, embed_dim=768, depth=6, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=int(embed_dim * mlp_ratio),
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True
+            )
+            for _ in range(depth)
+        ])
+        
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class BitemporalTransformer(nn.Module):
+    """Bitemporal Transformer for Change Detection"""
+    
+    def __init__(self, img_size=256, patch_size=16, in_channels=3, num_classes=2,
+                 embed_dim=768, depth=6, num_heads=8):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        
+        # Shared patch embedding
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        
+        # Position embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, embed_dim))
+        
+        # Shared transformer encoder
+        self.encoder = TransformerEncoder(embed_dim, depth, num_heads)
+        
+        # Fusion and decoder
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Decoder to upsample back to image size
+        self.decoder = nn.Sequential(
+            nn.Conv2d(embed_dim, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            nn.Conv2d(512, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            nn.Conv2d(64, num_classes, 1)
+        )
+        
+    def forward(self, img1, img2):
+        # Encode both images
+        x1 = self.patch_embed(img1) + self.pos_embed
+        x2 = self.patch_embed(img2) + self.pos_embed
+        
+        f1 = self.encoder(x1)  # (B, n_patches, embed_dim)
+        f2 = self.encoder(x2)  # (B, n_patches, embed_dim)
+        
+        # Fuse features
+        fused = torch.cat([f1, f2], dim=-1)  # (B, n_patches, embed_dim*2)
+        fused = self.fusion(fused)  # (B, n_patches, embed_dim)
+        
+        # Reshape for decoder
+        B = fused.shape[0]
+        h = w = int(self.n_patches ** 0.5)
+        fused = fused.transpose(1, 2).reshape(B, -1, h, w)
+        
+        # Decode to change map
+        out = self.decoder(fused)  # (B, num_classes, H, W)
+        
+        return out
+
+
+# ================== TRAINING ==================
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(dataloader, desc='Training')
+    for img1, img2, label, _ in pbar:
+        img1, img2, label = img1.to(device), img2.to(device), label.to(device)
+        
+        optimizer.zero_grad()
+        output = model(img1, img2)
+        loss = criterion(output, label)
+        
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        pred = output.argmax(dim=1)
+        correct += (pred == label).sum().item()
+        total += label.numel()
+        
+        pbar.set_postfix({'loss': loss.item(), 'acc': correct/total})
+    
+    return total_loss / len(dataloader), correct / total
+
+
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for img1, img2, label, _ in tqdm(dataloader, desc='Validation'):
+            img1, img2, label = img1.to(device), img2.to(device), label.to(device)
+            
+            output = model(img1, img2)
+            loss = criterion(output, label)
+            
+            total_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += (pred == label).sum().item()
+            total += label.numel()
+    
+    return total_loss / len(dataloader), correct / total
+
+
+def visualize_predictions(model, dataset, device, num_samples=4):
+    """Visualize model predictions"""
+    model.eval()
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, num_samples * 4))
+    
+    indices = np.random.choice(len(dataset), num_samples, replace=False)
+    
+    with torch.no_grad():
+        for i, idx in enumerate(indices):
+            img1, img2, label, name = dataset[idx]
+            
+            # Add batch dimension
+            img1_batch = img1.unsqueeze(0).to(device)
+            img2_batch = img2.unsqueeze(0).to(device)
+            
+            # Predict
+            output = model(img1_batch, img2_batch)
+            pred = output.argmax(dim=1).squeeze().cpu().numpy()
+            
+            # Denormalize images for display
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img1_display = (img1 * std + mean).permute(1, 2, 0).numpy()
+            img2_display = (img2 * std + mean).permute(1, 2, 0).numpy()
+            
+            # Plot
+            axes[i, 0].imshow(np.clip(img1_display, 0, 1))
+            axes[i, 0].set_title('Time 1')
+            axes[i, 0].axis('off')
+            
+            axes[i, 1].imshow(np.clip(img2_display, 0, 1))
+            axes[i, 1].set_title('Time 2')
+            axes[i, 1].axis('off')
+            
+            axes[i, 2].imshow(label.numpy(), cmap='gray')
+            axes[i, 2].set_title('Ground Truth')
+            axes[i, 2].axis('off')
+            
+            axes[i, 3].imshow(pred, cmap='gray')
+            axes[i, 3].set_title('Prediction')
+            axes[i, 3].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('predictions.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Saved predictions to predictions.png")
+
+
+# ================== MAIN TRAINING SCRIPT ==================
+if __name__ == "__main__":
+    # Configuration
+    IMG1_DIR = "path/to/img1"
+    IMG2_DIR = "path/to/img2"
+    LABEL_DIR = "path/to/label"
+    
+    IMG_SIZE = 256
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 50
+    LEARNING_RATE = 1e-4
+    
+    # Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create datasets
+    train_dataset = ChangeDetectionDataset(IMG1_DIR, IMG2_DIR, LABEL_DIR, img_size=IMG_SIZE)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    
+    # Create model
+    model = BitemporalTransformer(
+        img_size=IMG_SIZE,
+        patch_size=16,
+        in_channels=3,
+        num_classes=2,
+        embed_dim=512,
+        depth=6,
+        num_heads=8
+    ).to(device)
+    
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, NUM_EPOCHS)
+    
+    # Training loop
+    best_acc = 0
+    for epoch in range(NUM_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
+        
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        
+        scheduler.step()
+        
+        # Save best model
+        if train_acc > best_acc:
+            best_acc = train_acc
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f"Saved best model with accuracy: {best_acc:.4f}")
+    
+    # Visualize results
+    print("\nGenerating predictions visualization...")
+    visualize_predictions(model, train_dataset, device)
+    
+    print("\nTraining complete!")
