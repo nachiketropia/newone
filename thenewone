@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+"""
+GeoTIFF Processing Web Application
+Processes and overlays large TIFF files on interactive maps
+All HTML/JS embedded within Python
+"""
+
+import os
+import io
+import json
+import base64
+from pathlib import Path
+from flask import Flask, render_template_string, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+import numpy as np
+from PIL import Image
+
+# Optional imports for TIFF processing
+try:
+    import rasterio
+    from rasterio.merge import merge
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    from rasterio.enums import Resampling as ResamplingEnum
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    RASTERIO_AVAILABLE = False
+    print("⚠ rasterio not available. Install with: pip install rasterio")
+
+try:
+    from osgeo import gdal, osr
+    GDAL_AVAILABLE = True
+except ImportError:
+    GDAL_AVAILABLE = False
+    print("⚠ GDAL not available. Install with: pip install gdal")
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['OUTPUT_FOLDER'] = 'outputs'
+app.config['TILE_FOLDER'] = 'tiles'
+
+# Create necessary folders
+for folder in [app.config['UPLOAD_FOLDER'], app.config['OUTPUT_FOLDER'], app.config['TILE_FOLDER']]:
+    os.makedirs(folder, exist_ok=True)
+
+# HTML Template with embedded JavaScript
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoTIFF Processor - Python Edition</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; }
+        
+        .container { display: flex; height: 100vh; }
+        
+        .sidebar {
+            width: 350px;
+            background: #1f2937;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .header {
+            padding: 20px;
+            border-bottom: 1px solid #374151;
+        }
+        
+        .header h1 {
+            font-size: 20px;
+            margin-bottom: 5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .header p {
+            font-size: 13px;
+            color: #9ca3af;
+        }
+        
+        .upload-section {
+            padding: 20px;
+            border-bottom: 1px solid #374151;
+        }
+        
+        .upload-btn {
+            width: 100%;
+            padding: 12px;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: background 0.2s;
+        }
+        
+        .upload-btn:hover { background: #2563eb; }
+        
+        .merge-btn {
+            width: 100%;
+            padding: 12px;
+            background: #10b981;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .merge-btn:hover { background: #059669; }
+        .merge-btn:disabled { background: #6b7280; cursor: not-allowed; }
+        
+        .layers-section {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        .layers-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #9ca3af;
+            text-transform: uppercase;
+            margin-bottom: 15px;
+            letter-spacing: 0.5px;
+        }
+        
+        .layer-item {
+            background: #374151;
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 10px;
+            transition: all 0.2s;
+        }
+        
+        .layer-item:hover { border-color: #6b7280; }
+        
+        .layer-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        
+        .layer-name {
+            font-size: 14px;
+            font-weight: 500;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .layer-controls {
+            display: flex;
+            gap: 4px;
+        }
+        
+        .layer-btn {
+            background: #4b5563;
+            border: none;
+            color: white;
+            padding: 4px 7px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+        
+        .layer-btn:hover { background: #6b7280; }
+        
+        .layer-info {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-top: 8px;
+        }
+        
+        .opacity-control {
+            margin-top: 10px;
+        }
+        
+        .opacity-control label {
+            font-size: 11px;
+            color: #9ca3af;
+            display: block;
+            margin-bottom: 5px;
+        }
+        
+        .opacity-control input[type="range"] {
+            width: 100%;
+        }
+        
+        .status-bar {
+            padding: 15px 20px;
+            border-top: 1px solid #374151;
+            font-size: 11px;
+            color: #9ca3af;
+        }
+        
+        .map-container {
+            flex: 1;
+            position: relative;
+        }
+        
+        #map { width: 100%; height: 100%; }
+        
+        .map-controls {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 1000;
+        }
+        
+        .map-btn {
+            background: white;
+            border: none;
+            padding: 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .map-btn:hover { background: #f3f4f6; }
+        
+        .loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+        }
+        
+        .loading.active { display: flex; }
+        
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #374151;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            color: white;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #6b7280;
+        }
+        
+        .empty-state svg {
+            width: 60px;
+            height: 60px;
+            margin-bottom: 15px;
+            opacity: 0.3;
+        }
+        
+        .info-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(31, 41, 55, 0.95);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 400px;
+            font-size: 13px;
+            z-index: 1000;
+        }
+        
+        .info-panel h3 {
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        
+        .info-panel ul {
+            margin-left: 20px;
+            line-height: 1.6;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #3b82f6;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="loading" id="loading">
+        <div style="text-align: center;">
+            <div class="spinner"></div>
+            <div class="loading-text" id="loadingText">Processing...</div>
+        </div>
+    </div>
+    
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="header">
+                <h1>
+                    🗺️ GeoTIFF Processor
+                    <span class="badge">PYTHON</span>
+                </h1>
+                <p>Process & overlay large TIFF files</p>
+            </div>
+            
+            <div class="upload-section">
+                <label for="fileInput" class="upload-btn">
+                    📁 Upload GeoTIFF Files
+                    <input type="file" id="fileInput" multiple accept=".tif,.tiff" style="display:none;">
+                </label>
+                
+                <button class="merge-btn" id="mergeBtn" disabled>
+                    🔗 Merge All Layers
+                </button>
+                
+                <div style="margin-top: 15px;">
+                    <label style="display: block; font-size: 12px; color: #9ca3af; margin-bottom: 5px;">Base Map</label>
+                    <select id="baseMapSelect" style="width: 100%; padding: 8px; background: #374151; color: white; border: 1px solid #4b5563; border-radius: 6px; font-size: 13px; cursor: pointer;">
+                        <option value="satellite">Satellite Imagery</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="layers-section">
+                <div class="layers-title">LAYERS (<span id="layerCount">0</span>)</div>
+                <div id="layersList">
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                        </svg>
+                        <p>No layers loaded</p>
+                        <p style="font-size: 11px; margin-top: 5px;">Upload GeoTIFF files to begin</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="status-bar">
+                <div id="statusText">Ready • GDAL: {{ 'Available' if gdal_available else 'Not Available' }}</div>
+                <div style="margin-top: 5px; font-size: 10px; color: #6b7280;">
+                    <span id="coordinates">Lat: 0.0000, Lng: 0.0000 | Zoom: 2</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Map -->
+        <div class="map-container">
+            <div id="map"></div>
+            
+            <div class="map-controls">
+                <button class="map-btn" onclick="map.zoomIn()" title="Zoom In">➕</button>
+                <button class="map-btn" onclick="map.zoomOut()" title="Zoom Out">➖</button>
+                <button class="map-btn" onclick="map.setView([20, 0], 2)" title="Reset View">🌍</button>
+            </div>
+            
+            <div class="info-panel">
+                <h3>📊 Features</h3>
+                <ul>
+                    <li>Upload GeoTIFF files (auto-zoom to location)</li>
+                    <li>Satellite imagery base map</li>
+                    <li>Automatic coordinate transformation to WGS84</li>
+                    <li>Layer visibility & opacity controls</li>
+                    <li>Merge multiple files into one</li>
+                    <li>Export combined GeoTIFF</li>
+                </ul>
+                <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.2); font-size: 11px;">
+                    <strong>Tip:</strong> Click 📍 on any layer to zoom to its location. Use opacity slider to blend layers. Check console for coordinate details.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Initialize map
+        const map = L.map('map').setView([20, 0], 2);
+        
+        // Define base map layer - Satellite only
+        const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles © Esri',
+            maxZoom: 19
+        });
+        
+        // Add satellite layer to map
+        satelliteLayer.addTo(map);
+        
+        // Update coordinates on map move
+        function updateCoordinates() {
+            const center = map.getCenter();
+            const zoom = map.getZoom();
+            document.getElementById('coordinates').textContent = 
+                `Lat: ${center.lat.toFixed(4)}, Lng: ${center.lng.toFixed(4)} | Zoom: ${zoom}`;
+        }
+        
+        map.on('move', updateCoordinates);
+        map.on('zoom', updateCoordinates);
+        updateCoordinates();
+        
+        // Layer management
+        let layers = [];
+        let overlays = {};
+        
+        // Set initial status
+        setTimeout(() => updateStatus('Ready'), 100);
+        
+        // File upload handler
+        document.getElementById('fileInput').addEventListener('change', async (e) => {
+            const files = Array.from(e.target.files);
+            
+            for (const file of files) {
+                await uploadFile(file);
+            }
+            
+            e.target.value = '';
+        });
+        
+        async function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            showLoading(`Uploading ${file.name}...`);
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    layers.push(data.layer);
+                    addLayerToMap(data.layer);
+                    updateLayersList();
+                    updateStatus(`✓ Uploaded: ${file.name}`);
+                } else {
+                    alert(`Error: ${data.error}`);
+                    updateStatus('❌ Upload failed');
+                }
+            } catch (error) {
+                console.error('Upload error:', error);
+                alert(`Upload failed: ${error.message}`);
+                updateStatus('❌ Upload error');
+            } finally {
+                hideLoading();
+            }
+        }
+        
+        function addLayerToMap(layer) {
+            if (layer.bounds && layer.bounds.length === 4) {
+                // Log bounds for debugging
+                console.log('Layer:', layer.filename);
+                console.log('Bounds [W,S,E,N]:', layer.bounds);
+                console.log('CRS:', layer.crs);
+                console.log('Preview URL:', layer.preview_url);
+                
+                // Validate bounds are in valid lat/lng range
+                const [west, south, east, north] = layer.bounds;
+                if (Math.abs(south) > 90 || Math.abs(north) > 90 || 
+                    Math.abs(west) > 180 || Math.abs(east) > 180) {
+                    console.error('Invalid geographic bounds! Coordinates may not be in WGS84.');
+                    alert(`⚠️ Warning: ${layer.filename} has invalid coordinates.\n\n` +
+                          `Bounds: [${layer.bounds.join(', ')}]\n\n` +
+                          `These coordinates appear to be in a projected CRS, not WGS84. ` +
+                          `The file may display at the wrong location.`);
+                }
+                
+                const bounds = L.latLngBounds(
+                    [south, west],  // Southwest corner
+                    [north, east]   // Northeast corner
+                );
+                
+                console.log('Leaflet bounds:', bounds);
+                console.log('Southwest:', bounds.getSouthWest());
+                console.log('Northeast:', bounds.getNorthEast());
+                
+                // Create image overlay with error handling
+                const overlay = L.imageOverlay(layer.preview_url, bounds, {
+                    opacity: 0.7,
+                    interactive: true,
+                    crossOrigin: true
+                });
+                
+                // Add error handler
+                overlay.on('error', function(e) {
+                    console.error('Error loading image overlay:', layer.preview_url);
+                    alert(`Failed to load preview for ${layer.filename}. Check if the file was processed correctly.`);
+                });
+                
+                overlay.on('load', function() {
+                    console.log('Successfully loaded overlay for:', layer.filename);
+                });
+                
+                overlay.addTo(map);
+                overlays[layer.id] = overlay;
+                
+                // Automatically zoom to the uploaded file location with animation
+                map.flyToBounds(bounds, {
+                    padding: [50, 50],
+                    duration: 1.5,
+                    easeLinearity: 0.25
+                });
+                
+                // Add a marker at the center of the bounds
+                const center = bounds.getCenter();
+                const marker = L.marker(center, {
+                    title: layer.filename
+                }).addTo(map);
+                
+                marker.bindPopup(`
+                    <div style="font-family: sans-serif;">
+                        <strong>${layer.filename}</strong><br>
+                        <small style="color: #666;">
+                            Size: ${layer.width} × ${layer.height} px<br>
+                            CRS: ${layer.crs || 'Unknown'}<br>
+                            Center: ${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}<br>
+                            Bounds: [${layer.bounds.map(b => b.toFixed(4)).join(', ')}]
+                        </small>
+                    </div>
+                `);
+                
+                // Store marker reference
+                overlays[layer.id + '_marker'] = marker;
+                
+                updateStatus(`📍 Zoomed to ${layer.filename}`);
+            } else {
+                console.warn('No valid bounds available for layer:', layer.filename);
+                updateStatus(`⚠️ No location data for ${layer.filename}`);
+            }
+        }
+        
+        function updateLayersList() {
+            const container = document.getElementById('layersList');
+            document.getElementById('layerCount').textContent = layers.length;
+            
+            if (layers.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                        </svg>
+                        <p>No layers loaded</p>
+                    </div>
+                `;
+                document.getElementById('mergeBtn').disabled = true;
+                return;
+            }
+            
+            document.getElementById('mergeBtn').disabled = layers.length < 2;
+            
+            container.innerHTML = layers.map(layer => `
+                <div class="layer-item">
+                    <div class="layer-header">
+                        <div class="layer-name">${layer.filename}</div>
+                        <div class="layer-controls">
+                            <button class="layer-btn" onclick="zoomToLayer('${layer.id}')" title="Zoom to layer">📍</button>
+                            <button class="layer-btn" onclick="toggleLayer('${layer.id}')" title="Toggle visibility">👁️</button>
+                            <button class="layer-btn" onclick="removeLayer('${layer.id}')" title="Remove layer">🗑️</button>
+                        </div>
+                    </div>
+                    <div class="opacity-control">
+                        <label>Opacity: <span id="opacity-${layer.id}">70</span>%</label>
+                        <input type="range" min="0" max="100" value="70" 
+                               oninput="setOpacity('${layer.id}', this.value)">
+                    </div>
+                    <div class="layer-info">
+                        Size: ${layer.width} × ${layer.height} px<br>
+                        ${layer.crs || 'Unknown CRS'}<br>
+                        Bounds: [${layer.bounds ? layer.bounds.map(b => b.toFixed(4)).join(', ') : 'N/A'}]
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        function zoomToLayer(layerId) {
+            const layer = layers.find(l => l.id === layerId);
+            if (layer && layer.bounds) {
+                const bounds = L.latLngBounds(
+                    [layer.bounds[1], layer.bounds[0]],
+                    [layer.bounds[3], layer.bounds[2]]
+                );
+                
+                map.flyToBounds(bounds, {
+                    padding: [50, 50],
+                    duration: 1.5,
+                    easeLinearity: 0.25
+                });
+                
+                updateStatus(`📍 Zoomed to ${layer.filename}`);
+            }
+        }
+        
+        function toggleLayer(layerId) {
+            const overlay = overlays[layerId];
+            const marker = overlays[layerId + '_marker'];
+            
+            if (overlay) {
+                if (map.hasLayer(overlay)) {
+                    map.removeLayer(overlay);
+                    if (marker) map.removeLayer(marker);
+                } else {
+                    overlay.addTo(map);
+                    if (marker) marker.addTo(map);
+                }
+            }
+        }
+        
+        function setOpacity(layerId, value) {
+            const overlay = overlays[layerId];
+            if (overlay) {
+                overlay.setOpacity(value / 100);
+            }
+            document.getElementById(`opacity-${layerId}`).textContent = value;
+        }
+        
+        function removeLayer(layerId) {
+            const overlay = overlays[layerId];
+            const marker = overlays[layerId + '_marker'];
+            
+            if (overlay) {
+                map.removeLayer(overlay);
+                delete overlays[layerId];
+            }
+            if (marker) {
+                map.removeLayer(marker);
+                delete overlays[layerId + '_marker'];
+            }
+            
+            layers = layers.filter(l => l.id !== layerId);
+            updateLayersList();
+        }
+        
+        // Merge layers
+        document.getElementById('mergeBtn').addEventListener('click', async () => {
+            if (layers.length < 2) return;
+            
+            showLoading('Merging layers...');
+            
+            try {
+                const response = await fetch('/merge', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ layer_ids: layers.map(l => l.id) })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    alert(`✓ Merge complete!\n\nOutput: ${data.output_file}\n\nDownload available.`);
+                    window.open(data.download_url, '_blank');
+                    updateStatus('✓ Merge successful');
+                } else {
+                    alert(`Merge failed: ${data.error}`);
+                    updateStatus('❌ Merge failed');
+                }
+            } catch (error) {
+                alert(`Merge failed: ${error.message}`);
+                updateStatus('❌ Merge error');
+            } finally {
+                hideLoading();
+            }
+        });
+        
+        function showLoading(text) {
+            document.getElementById('loading').classList.add('active');
+            document.getElementById('loadingText').textContent = text;
+        }
+        
+        function hideLoading() {
+            document.getElementById('loading').classList.remove('active');
+        }
+        
+        function updateStatus(text) {
+            const statusDiv = document.getElementById('statusText');
+            const gdalStatus = "{{ 'Available' if gdal_available else 'Not Available' }}";
+            statusDiv.textContent = `${text} • GDAL: ${gdalStatus}`;
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+class TIFFProcessor:
+    """Handle TIFF file processing operations"""
+    
+    @staticmethod
+    def get_tiff_info(filepath):
+        """Extract metadata from TIFF file"""
+        info = {
+            'width': None,
+            'height': None,
+            'bounds': None,
+            'crs': None,
+            'bands': None
+        }
+        
+        if RASTERIO_AVAILABLE:
+            try:
+                with rasterio.open(filepath) as src:
+                    info['width'] = src.width
+                    info['height'] = src.height
+                    info['bands'] = src.count
+                    info['crs'] = str(src.crs) if src.crs else None
+                    
+                    # Get bounds and transform to WGS84 (EPSG:4326) for web mapping
+                    bounds = src.bounds
+                    
+                    print(f"Original CRS: {src.crs}")
+                    print(f"Original bounds: {bounds}")
+                    
+                    # Check if we need to transform coordinates
+                    if src.crs and src.crs != 'EPSG:4326':
+                        from rasterio.warp import transform_bounds
+                        # Transform bounds to WGS84
+                        bounds_wgs84 = transform_bounds(src.crs, 'EPSG:4326', 
+                                                       bounds.left, bounds.bottom, 
+                                                       bounds.right, bounds.top)
+                        info['bounds'] = list(bounds_wgs84)  # [west, south, east, north]
+                        print(f"Transformed to WGS84: {info['bounds']}")
+                    else:
+                        # Already in WGS84 or no CRS
+                        info['bounds'] = [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                        print(f"Using original bounds (already WGS84 or no CRS)")
+                    
+                return info
+            except Exception as e:
+                print(f"Error reading TIFF: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Fallback to PIL for basic info
+        try:
+            with Image.open(filepath) as img:
+                info['width'], info['height'] = img.size
+        except:
+            pass
+        
+        return info
+    
+    @staticmethod
+    def create_preview(filepath, output_path, max_size=2048):
+        """Create a high-quality preview image from TIFF"""
+        try:
+            print(f"Creating preview for: {filepath}")
+            
+            # First try with rasterio (best for GeoTIFF)
+            if RASTERIO_AVAILABLE:
+                try:
+                    with rasterio.open(filepath) as src:
+                        print(f"TIFF Info - Width: {src.width}, Height: {src.height}, Bands: {src.count}")
+                        print(f"Data type: {src.dtypes[0]}, NoData: {src.nodata}")
+                        
+                        # Calculate optimal size for preview
+                        scale = min(max_size / src.width, max_size / src.height, 1.0)
+                        out_width = int(src.width * scale)
+                        out_height = int(src.height * scale)
+                        
+                        print(f"Preview size: {out_width}x{out_height} (scale: {scale:.3f})")
+                        
+                        # Read data with downsampling
+                        bands_data = []
+                        
+                        if src.count >= 3:
+                            # RGB - read first 3 bands
+                            print("Reading RGB bands...")
+                            for i in range(1, 4):
+                                band = src.read(
+                                    i, 
+                                    out_shape=(out_height, out_width), 
+                                    resampling=Resampling.bilinear
+                                )
+                                bands_data.append(band)
+                            
+                            # Stack into RGB array
+                            data = np.stack(bands_data, axis=-1)
+                            print(f"RGB data shape: {data.shape}, dtype: {data.dtype}")
+                            
+                        elif src.count == 1:
+                            # Grayscale
+                            print("Reading grayscale band...")
+                            data = src.read(
+                                1, 
+                                out_shape=(out_height, out_width), 
+                                resampling=Resampling.bilinear
+                            )
+                            print(f"Grayscale data shape: {data.shape}, dtype: {data.dtype}")
+                        else:
+                            # Multiple bands but not standard RGB - use first 3 or first band
+                            print(f"Reading first 3 bands from {src.count} total bands...")
+                            for i in range(1, min(4, src.count + 1)):
+                                band = src.read(
+                                    i, 
+                                    out_shape=(out_height, out_width), 
+                                    resampling=Resampling.bilinear
+                                )
+                                bands_data.append(band)
+                            
+                            if len(bands_data) >= 3:
+                                data = np.stack(bands_data[:3], axis=-1)
+                            else:
+                                data = bands_data[0]
+                        
+                        # Handle different data types and normalize to uint8
+                        print(f"Data dtype: {data.dtype}, shape: {data.shape}")
+                        print(f"Data range before normalization: [{np.min(data)}, {np.max(data)}]")
+                        
+                        # Handle nodata values first
+                        if src.nodata is not None:
+                            print(f"Masking nodata values: {src.nodata}")
+                            if len(data.shape) == 3:
+                                # For RGB
+                                for i in range(data.shape[2]):
+                                    mask = data[:, :, i] == src.nodata
+                                    data[:, :, i] = np.where(mask, 0, data[:, :, i])
+                            else:
+                                mask = data == src.nodata
+                                data = np.where(mask, 0, data)
+                        
+                        # Normalize to uint8
+                        if data.dtype == np.uint8:
+                            print("Data already uint8, using as-is")
+                            result = data
+                        elif data.dtype == np.uint16:
+                            print("Converting uint16 to uint8...")
+                            # For 16-bit data, scale down
+                            result = (data / 256).astype(np.uint8)
+                        elif np.issubdtype(data.dtype, np.floating):
+                            print("Converting float to uint8...")
+                            # For float data, normalize based on actual range
+                            if len(data.shape) == 3:
+                                result = np.zeros(data.shape, dtype=np.uint8)
+                                for i in range(data.shape[2]):
+                                    channel = data[:, :, i]
+                                    valid = channel[channel != 0]
+                                    
+                                    if len(valid) > 0:
+                                        # Use percentiles for better contrast
+                                        vmin, vmax = np.percentile(valid, [2, 98])
+                                        if vmax > vmin:
+                                            normalized = np.clip((channel - vmin) / (vmax - vmin), 0, 1)
+                                            result[:, :, i] = (normalized * 255).astype(np.uint8)
+                                        else:
+                                            result[:, :, i] = np.clip(channel * 255, 0, 255).astype(np.uint8)
+                                    else:
+                                        result[:, :, i] = 0
+                            else:
+                                valid = data[data != 0]
+                                if len(valid) > 0:
+                                    vmin, vmax = np.percentile(valid, [2, 98])
+                                    if vmax > vmin:
+                                        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+                                        result = (normalized * 255).astype(np.uint8)
+                                    else:
+                                        result = np.clip(data * 255, 0, 255).astype(np.uint8)
+                                else:
+                                    result = np.zeros_like(data, dtype=np.uint8)
+                        else:
+                            print(f"Converting {data.dtype} to uint8...")
+                            # For other integer types
+                            if len(data.shape) == 3:
+                                result = np.zeros(data.shape, dtype=np.uint8)
+                                for i in range(data.shape[2]):
+                                    channel = data[:, :, i]
+                                    valid = channel[channel != 0]
+                                    
+                                    if len(valid) > 0:
+                                        vmin, vmax = np.percentile(valid, [2, 98])
+                                        if vmax > vmin:
+                                            normalized = np.clip((channel - vmin) / (vmax - vmin), 0, 1)
+                                            result[:, :, i] = (normalized * 255).astype(np.uint8)
+                            else:
+                                valid = data[data != 0]
+                                if len(valid) > 0:
+                                    vmin, vmax = np.percentile(valid, [2, 98])
+                                    if vmax > vmin:
+                                        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+                                        result = (normalized * 255).astype(np.uint8)
+                        
+                        print(f"Final data shape: {result.shape}, dtype: {result.dtype}")
+                        print(f"Final data range: [{np.min(result)}, {np.max(result)}]")
+                        
+                        # Create PIL image
+                        if len(result.shape) == 3:
+                            if result.shape[2] == 4:
+                                img = Image.fromarray(result, mode='RGBA')
+                            elif result.shape[2] == 3:
+                                img = Image.fromarray(result, mode='RGB')
+                            else:
+                                # Single channel stored as 3D array
+                                img = Image.fromarray(result[:, :, 0], mode='L').convert('RGB')
+                        else:
+                            img = Image.fromarray(result, mode='L').convert('RGB')
+                        
+                        print(f"Created PIL image: {img.size}, mode: {img.mode}")
+                        
+                except Exception as e:
+                    print(f"Rasterio method failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                    
+            else:
+                # Fallback to PIL only
+                print("Rasterio not available, using PIL...")
+                img = Image.open(filepath)
+                print(f"Opened with PIL: {img.size}, mode: {img.mode}")
+                
+                # Convert to RGB if needed
+                if img.mode not in ('RGB', 'RGBA'):
+                    print(f"Converting from {img.mode} to RGB")
+                    img = img.convert('RGB')
+                
+                # Resize if needed
+                if img.width > max_size or img.height > max_size:
+                    print(f"Resizing from {img.size} to fit {max_size}x{max_size}")
+                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Save with high quality
+            print(f"Saving preview to: {output_path}")
+            img.save(output_path, 'PNG', quality=95, optimize=False)
+            
+            # Verify the file was created
+            if not os.path.exists(output_path):
+                print(f"ERROR: Preview file was not created at {output_path}")
+                return False
+            
+            file_size = os.path.getsize(output_path)
+            print(f"✓ Preview created successfully: {output_path}")
+            print(f"  Image size: {img.size[0]}x{img.size[1]}, File size: {file_size/1024:.1f} KB")
+            
+            return True
+            
+        except Exception as e:
+            print(f"ERROR creating preview: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try a very simple fallback method with PIL only
+            try:
+                print("\nAttempting simple PIL fallback method...")
+                from PIL import Image
+                
+                img = Image.open(filepath)
+                print(f"Opened image: {img.size}, mode: {img.mode}, format: {img.format}")
+                
+                # Handle different modes
+                if img.mode == 'I' or img.mode == 'I;16':
+                    # 16-bit integer, convert to 8-bit
+                    print("Converting 16-bit integer to 8-bit")
+                    img_array = np.array(img)
+                    img_array = (img_array / 256).astype(np.uint8)
+                    img = Image.fromarray(img_array)
+                elif img.mode == 'F':
+                    # 32-bit float, normalize to 8-bit
+                    print("Converting 32-bit float to 8-bit")
+                    img_array = np.array(img)
+                    img_array = np.clip(img_array * 255, 0, 255).astype(np.uint8)
+                    img = Image.fromarray(img_array)
+                elif img.mode not in ('RGB', 'RGBA', 'L'):
+                    print(f"Converting {img.mode} to RGB")
+                    img = img.convert('RGB')
+                
+                # Resize if too large
+                if img.width > max_size or img.height > max_size:
+                    print(f"Resizing from {img.size}")
+                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                # Ensure RGB
+                if img.mode == 'L':
+                    img = img.convert('RGB')
+                elif img.mode == 'RGBA':
+                    # Create white background
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[3])
+                    img = background
+                
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                img.save(output_path, 'PNG')
+                
+                if os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+                    print(f"✓ Fallback preview created: {output_path} ({file_size/1024:.1f} KB)")
+                    return True
+                else:
+                    print("ERROR: Fallback method did not create file")
+                    return False
+                    
+            except Exception as e2:
+                print(f"ERROR in fallback method: {e2}")
+                import traceback
+                traceback.print_exc()
+                return False
+    
+    @staticmethod
+    def merge_tiffs(input_files, output_file):
+        """Merge multiple TIFF files"""
+        if not RASTERIO_AVAILABLE:
+            return False, "rasterio not available"
+        
+        try:
+            # Open all source files
+            src_files = [rasterio.open(f) for f in input_files]
+            
+            # Merge
+            mosaic, out_transform = merge(src_files)
+            
+            # Copy metadata from first file
+            out_meta = src_files[0].meta.copy()
+            out_meta.update({
+                "driver": "GTiff",
+                "height": mosaic.shape[1],
+                "width": mosaic.shape[2],
+                "transform": out_transform,
+                "compress": "lzw"
+            })
+            
+            # Write output
+            with rasterio.open(output_file, "w", **out_meta) as dest:
+                dest.write(mosaic)
+            
+            # Close sources
+            for src in src_files:
+                src.close()
+            
+            return True, "Merge successful"
+            
+        except Exception as e:
+            return False, str(e)
+
+
+# Flask routes
+@app.route('/')
+def index():
+    """Serve main page"""
+    return render_template_string(
+        HTML_TEMPLATE,
+        gdal_available=GDAL_AVAILABLE,
+        rasterio_available=RASTERIO_AVAILABLE
+    )
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload"""
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file provided'})
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No file selected'})
+    
+    if not file.filename.lower().endswith(('.tif', '.tiff')):
+        return jsonify({'success': False, 'error': 'Not a TIFF file'})
+    
+    try:
+        # Save file
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        print(f"\n{'='*70}")
+        print(f"Processing uploaded file: {filename}")
+        print(f"File path: {filepath}")
+        print(f"File size: {os.path.getsize(filepath) / (1024*1024):.2f} MB")
+        print(f"{'='*70}")
+        
+        # Get TIFF info
+        info = TIFFProcessor.get_tiff_info(filepath)
+        
+        if info['width'] is None or info['height'] is None:
+            return jsonify({'success': False, 'error': 'Could not read TIFF dimensions'})
+        
+        print(f"TIFF Info:")
+        print(f"  Size: {info['width']} x {info['height']} pixels")
+        print(f"  Bands: {info['bands']}")
+        print(f"  CRS: {info['crs']}")
+        print(f"  Bounds (WGS84): {info['bounds']}")
+        
+        # Validate bounds
+        if not info['bounds'] or len(info['bounds']) != 4:
+            return jsonify({'success': False, 'error': 'Could not extract valid geographic bounds from TIFF'})
+        
+        # Create preview with unique ID
+        import time
+        layer_id = f"layer_{int(time.time() * 1000)}_{os.getpid()}"
+        preview_filename = f"{layer_id}_preview.png"
+        preview_path = os.path.join(app.config['OUTPUT_FOLDER'], preview_filename)
+        
+        print(f"\nCreating preview...")
+        print(f"  Preview filename: {preview_filename}")
+        print(f"  Preview path: {preview_path}")
+        
+        preview_created = TIFFProcessor.create_preview(filepath, preview_path)
+        
+        if not preview_created:
+            return jsonify({'success': False, 'error': 'Failed to create preview image. Check server logs for details.'})
+        
+        # Verify preview file exists and has content
+        if not os.path.exists(preview_path):
+            return jsonify({'success': False, 'error': f'Preview file was not created at: {preview_path}'})
+        
+        preview_size = os.path.getsize(preview_path)
+        if preview_size == 0:
+            return jsonify({'success': False, 'error': 'Preview file is empty'})
+        
+        print(f"✓ Preview file verified: {preview_size / 1024:.1f} KB")
+        
+        # Layer data
+        layer = {
+            'id': layer_id,
+            'filename': filename,
+            'filepath': filepath,
+            'width': info['width'],
+            'height': info['height'],
+            'bounds': info['bounds'],
+            'crs': info['crs'],
+            'preview_url': f'/preview/{preview_filename}?t={int(time.time())}'  # Add cache-busting timestamp
+        }
+        
+        print(f"✓ Upload successful!")
+        print(f"  Layer ID: {layer_id}")
+        print(f"  Preview URL: {layer['preview_url']}")
+        print(f"{'='*70}\n")
+        
+        return jsonify({'success': True, 'layer': layer})
+        
+    except Exception as e:
+        print(f"\n{'!'*70}")
+        print(f"ERROR during upload: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'!'*70}\n")
+        return jsonify({'success': False, 'error': f'Upload error: {str(e)}'})
+
+
+@app.route('/merge', methods=['POST'])
+def merge_layers():
+    """Merge multiple TIFF layers"""
+    data = request.get_json()
+    layer_ids = data.get('layer_ids', [])
+    
+    if len(layer_ids) < 2:
+        return jsonify({'success': False, 'error': 'Need at least 2 layers'})
+    
+    try:
+        # Find layer files
+        input_files = []
+        for layer_id in layer_ids:
+            # Find matching file
+            for f in os.listdir(app.config['UPLOAD_FOLDER']):
+                if layer_id in f or f.startswith(layer_id):
+                    input_files.append(os.path.join(app.config['UPLOAD_FOLDER'], f))
+                    break
+        
+        if len(input_files) < 2:
+            return jsonify({'success': False, 'error': 'Could not find layer files'})
+        
+        # Merge
+        output_file = os.path.join(app.config['OUTPUT_FOLDER'], 'merged_output.tif')
+        success, message = TIFFProcessor.merge_tiffs(input_files, output_file)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'output_file': output_file,
+                'download_url': '/download/merged_output.tif'
+            })
+        else:
+            return jsonify({'success': False, 'error': message})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/preview/<filename>')
+def serve_preview(filename):
+    """Serve preview images"""
+    try:
+        filepath = os.path.join(app.config['OUTPUT_FOLDER'], filename)
+        print(f"Preview request for: {filename}")
+        print(f"Looking at path: {filepath}")
+        
+        if not os.path.exists(filepath):
+            print(f"ERROR: Preview file not found at {filepath}")
+            print(f"Files in output folder: {os.listdir(app.config['OUTPUT_FOLDER'])}")
+            return "Preview not found", 404
+        
+        file_size = os.path.getsize(filepath)
+        print(f"Serving preview: {filepath} ({file_size / 1024:.1f} KB)")
+        
+        return send_file(
+            filepath, 
+            mimetype='image/png',
+            as_attachment=False,
+            download_name=filename
+        )
+    except Exception as e:
+        print(f"ERROR serving preview: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error: {str(e)}", 500
+
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    """Download merged TIFF"""
+    filepath = os.path.join(app.config['OUTPUT_FOLDER'], filename)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True, download_name=filename)
+    return "Not found", 404
+
+
+if __name__ == '__main__':
+    print("="*70)
+    print("GeoTIFF Processing Web Application")
+    print("="*70)
+    print(f"\n✓ Flask server starting...")
+    print(f"✓ GDAL Available: {GDAL_AVAILABLE}")
+    print(f"✓ Rasterio Available: {RASTERIO_AVAILABLE}")
+    print(f"\n📂 Upload folder: {app.config['UPLOAD_FOLDER']}")
+    print(f"📂 Output folder: {app.config['OUTPUT_FOLDER']}")
+    print(f"\n🌐 Open browser to: http://localhost:5000")
+    print("="*70)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
