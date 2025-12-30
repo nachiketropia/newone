@@ -1,0 +1,161 @@
+import os
+import io
+import uuid
+import tempfile
+from flask import Flask, request, jsonify, send_from_directory, send_file, render_template
+import numpy as np
+from PIL import Image
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.merge import merge as rio_merge
+
+app = Flask(__name__)
+
+UPLOAD_FOLDER = 'uploads'
+PREVIEW_FOLDER = 'previews'
+COMBINED_FOLDER = 'combined'
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PREVIEW_FOLDER, exist_ok=True)
+os.makedirs(COMBINED_FOLDER, exist_ok=True)
+
+# registry to track uploads
+LAYER_REGISTRY = {}
+
+# ---------- Helper functions ---------- #
+
+def create_preview(filepath):
+    """Create a small PNG preview of a GeoTIFF."""
+    try:
+        with rasterio.open(filepath) as src:
+            # pick the first three bands if available
+            if src.count >= 3:
+                data = src.read([1, 2, 3], out_shape=(3, int(src.height / 10), int(src.width / 10)), resampling=Resampling.bilinear)
+                data = np.moveaxis(data, 0, -1)
+                data = np.clip((data - data.min()) / (data.max() - data.min()) * 255, 0, 255).astype(np.uint8)
+                image = Image.fromarray(data)
+            else:
+                data = src.read(1, out_shape=(int(src.height / 10), int(src.width / 10)), resampling=Resampling.bilinear)
+                data = np.clip((data - data.min()) / (data.max() - data.min()) * 255, 0, 255).astype(np.uint8)
+                image = Image.fromarray(data).convert("L")
+
+            preview_name = f"{uuid.uuid4().hex}.png"
+            preview_path = os.path.join(PREVIEW_FOLDER, preview_name)
+            image.save(preview_path)
+            return preview_name
+    except Exception as e:
+        print("Preview creation failed:", e)
+        return None
+
+
+def combine_geotiffs(filepaths, output_path):
+    """Merge multiple GeoTIFF files into one."""
+    try:
+        datasets = [rasterio.open(fp) for fp in filepaths]
+        # Reproject if needed
+        first_crs = datasets[0].crs
+        reprojected = []
+        for ds in datasets:
+            if ds.crs != first_crs:
+                temp = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+                temp.close()
+                rasterio.warp.reproject(
+                    source=rasterio.band(ds, 1),
+                    destination=temp.name,
+                    src_transform=ds.transform,
+                    src_crs=ds.crs,
+                    dst_transform=datasets[0].transform,
+                    dst_crs=first_crs,
+                    resampling=Resampling.nearest
+                )
+                reprojected.append(rasterio.open(temp.name))
+            else:
+                reprojected.append(ds)
+
+        mosaic, out_trans = rio_merge(reprojected)
+        out_meta = datasets[0].meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_trans
+        })
+
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(mosaic)
+        for ds in datasets + reprojected:
+            ds.close()
+        return True
+    except Exception as e:
+        print("Merge failed:", e)
+        return False
+
+
+# ---------- Routes ---------- #
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.tif', '.tiff']:
+        return jsonify({"error": "Only GeoTIFF files allowed"}), 400
+
+    unique_filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(UPLOAD_FOLDER, unique_filename)
+    file.save(filepath)
+
+    preview_name = create_preview(filepath)
+    layer_id = uuid.uuid4().hex
+    LAYER_REGISTRY[layer_id] = filepath
+
+    return jsonify({
+        "message": "File uploaded successfully",
+        "preview": preview_name,
+        "layer_id": layer_id
+    })
+
+
+@app.route('/preview/<filename>')
+def get_preview(filename):
+    return send_from_directory(PREVIEW_FOLDER, filename)
+
+
+@app.route('/merge', methods=['POST'])
+def merge_files():
+    try:
+        layer_ids = request.json.get("layer_ids", [])
+        if not layer_ids:
+            return jsonify({"error": "No layer IDs provided"}), 400
+
+        filepaths = [LAYER_REGISTRY[lid] for lid in layer_ids if lid in LAYER_REGISTRY]
+        if not filepaths:
+            return jsonify({"error": "No valid files found"}), 400
+
+        output_name = f"merged_{uuid.uuid4().hex}.tif"
+        output_path = os.path.join(COMBINED_FOLDER, output_name)
+        if combine_geotiffs(filepaths, output_path):
+            return jsonify({"message": "Merged successfully", "file": output_name})
+        else:
+            return jsonify({"error": "Merge failed"}), 500
+    except Exception as e:
+        print(e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/combined/<filename>')
+def get_combined(filename):
+    return send_from_directory(COMBINED_FOLDER, filename)
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5002, debug=True)
